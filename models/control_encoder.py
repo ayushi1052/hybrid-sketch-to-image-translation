@@ -1,0 +1,1 @@
+"""Control encoder model."""

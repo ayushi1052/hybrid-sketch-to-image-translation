@@ -1,0 +1,1 @@
+"""Structure GAN model."""
