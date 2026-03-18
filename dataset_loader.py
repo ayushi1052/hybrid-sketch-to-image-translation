@@ -1,126 +1,87 @@
 """
 dataset_loader.py
 ==================
-Dataset loader for your exact folder structure:
+Dataset loader — with full exception handling
 
+Handles your exact structure:
     dataset/
-        sketch/
-            aeroplane/   img1.jpg  img2.jpg ...
-            apple/       img1.jpg  img2.jpg ...
-            ball/        img1.jpg  img2.jpg ...
-            ...
-        photo/
-            aeroplane/   img1.jpg  img2.jpg ...
-            apple/       img1.jpg  img2.jpg ...
-            ball/        img1.jpg  img2.jpg ...
-            ...
-
-Pairing logic:
-  sketch/aeroplane/img1.jpg  ↔  photo/aeroplane/img1.jpg  (same name, same category)
-
-If filenames don't match within a category, pairs are made by sorted order.
-
-Each item returned:
-    sketch_tensor   : (3, 256, 256)  float [0, 1]
-    photo_tensor    : (3, 256, 256)  float [-1, 1]   (SD normalisation)
-    structure_tensor: (5, 256, 256)  float [0, 1]    (edge+depth+seg)
-    caption         : "a realistic photo of a <category>"
-    category        : str  e.g. "aeroplane"
-    stem            : filename stem
+        sketch/  airplane/  apple/  ...
+        photo/   airplane/  apple/  ...
 """
 
 import os
+import sys
+import traceback
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
 from models.structure_gan import StructureExtractor
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
-
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sketch Augmentor  (closes the edge-map → freehand-sketch domain gap)
+# Sketch Augmentor
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SketchAugmentor:
-    """
-    Applies sketch-style augmentations during training.
-    Simulates real freehand drawing characteristics so the model
-    handles real user sketches better at inference.
-
-    This is something D-Sketch does NOT do — it's trained only on
-    clean Canny edge maps and struggles on rough freehand sketches.
-    """
-
     def __init__(self, p: float = 0.5):
-        """p: probability of each augmentation being applied."""
         self.p = p
 
     def __call__(self, sketch_np: np.ndarray) -> np.ndarray:
         import random
         if random.random() > self.p:
             return sketch_np
-        sketch_np = self._random_stroke_width(sketch_np)
-        sketch_np = self._random_line_breaks(sketch_np)
-        sketch_np = self._add_hand_tremor(sketch_np)
+        try:
+            sketch_np = self._stroke_width(sketch_np)
+        except Exception:
+            pass
+        try:
+            sketch_np = self._line_breaks(sketch_np)
+        except Exception:
+            pass
+        try:
+            sketch_np = self._tremor(sketch_np)
+        except Exception:
+            pass
         return sketch_np
 
-    def _random_stroke_width(self, img: np.ndarray) -> np.ndarray:
-        """Vary stroke thickness to simulate different pen/pencil sizes."""
+    def _stroke_width(self, img):
         import cv2, random
         gray   = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         _, bw  = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
         k      = random.choice([1, 2, 3])
         if k > 1:
             bw = cv2.dilate(bw, np.ones((k, k), np.uint8))
-        result = 255 - bw
-        return np.stack([result] * 3, axis=-1)
+        return np.stack([255 - bw] * 3, axis=-1)
 
-    def _random_line_breaks(
-        self, img: np.ndarray, drop_rate: float = 0.03
-    ) -> np.ndarray:
-        """Randomly remove small patches (simulates incomplete strokes)."""
+    def _line_breaks(self, img, rate=0.03):
         import random
         img  = img.copy()
         h, w = img.shape[:2]
-        n    = int(h * w * drop_rate / 9)
-        for _ in range(n):
+        for _ in range(int(h * w * rate / 9)):
             y = random.randint(0, h - 3)
             x = random.randint(0, w - 3)
             img[y:y+3, x:x+3] = 255
         return img
 
-    def _add_hand_tremor(
-        self, img: np.ndarray, sigma: float = 0.6
-    ) -> np.ndarray:
-        """Slight Gaussian blur to simulate shaky hand."""
+    def _tremor(self, img, sigma=0.6):
         import cv2
         return cv2.GaussianBlur(img, (3, 3), sigma)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Caption builder
-# ─────────────────────────────────────────────────────────────────────────────
-
 def build_caption(category: str) -> str:
-    """
-    Auto-generate a descriptive text prompt from the category name.
-    e.g. 'aeroplane' → 'a realistic photo of an aeroplane'
-    """
-    vowels     = "aeiou"
-    article    = "an" if category[0].lower() in vowels else "a"
-    clean_name = category.replace("_", " ").replace("-", " ")
-    return f"a realistic photo of {article} {clean_name}, highly detailed"
+    if not category or not category.strip():
+        return "a realistic photo, highly detailed"
+    vowels  = "aeiou"
+    name    = category.strip().replace("_", " ").replace("-", " ")
+    article = "an" if name[0].lower() in vowels else "a"
+    return f"a realistic photo of {article} {name}, highly detailed"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,33 +89,15 @@ def build_caption(category: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SketchPhotoDataset(Dataset):
-    """
-    Sketch-Photo dataset supporting your exact category subfolder structure.
-
-        dataset/
-          sketch/category/img.jpg  ↔  photo/category/img.jpg
-
-    Parameters
-    ----------
-    data_dir       : root directory (contains 'sketch/' and 'photo/')
-    img_size       : resize target (your images are 256×256, set to 256)
-    extractor      : StructureExtractor; if None uses raw sketch channels
-    categories     : list of category names to use; None = all categories
-    augment        : apply SketchAugmentor during training
-    caption_mode   : 'auto' = generate from category name
-                     'fixed' = use a single fixed caption
-    fixed_caption  : used when caption_mode='fixed'
-    """
-
     def __init__(
         self,
-        data_dir:       str,
-        img_size:       int  = 256,
-        extractor:      Optional[StructureExtractor] = None,
-        categories:     Optional[List[str]] = None,
-        augment:        bool = True,
-        caption_mode:   str  = "auto",
-        fixed_caption:  str  = "a realistic photo, highly detailed",
+        data_dir:      str,
+        img_size:      int  = 256,
+        extractor:     Optional[StructureExtractor] = None,
+        categories:    Optional[List[str]] = None,
+        augment:       bool = True,
+        caption_mode:  str  = "auto",
+        fixed_caption: str  = "a realistic photo, highly detailed",
     ):
         self.data_dir      = Path(data_dir)
         self.img_size      = img_size
@@ -162,90 +105,117 @@ class SketchPhotoDataset(Dataset):
         self.augment       = augment
         self.caption_mode  = caption_mode
         self.fixed_caption = fixed_caption
+        self.augmentor     = SketchAugmentor(p=0.5) if augment else None
 
-        self.augmentor = SketchAugmentor(p=0.5) if augment else None
-
-        # ── Validate folder structure ─────────────────────────────────────
+        # ── Validate root structure ────────────────────────────────────────
         self.sketch_root = self.data_dir / "sketch"
         self.photo_root  = self.data_dir / "photo"
 
-        for d in [self.sketch_root, self.photo_root]:
+        for label, d in [("sketch", self.sketch_root), ("photo", self.photo_root)]:
             if not d.exists():
                 raise FileNotFoundError(
-                    f"Expected directory not found: {d}\n"
-                    f"Make sure your dataset has 'sketch/' and 'photo/' subfolders."
+                    f"Required directory not found: {d}\n"
+                    f"  Expected: {data_dir}/{label}/<category>/<image.jpg>"
                 )
+            if not d.is_dir():
+                raise NotADirectoryError(f"Expected a directory but got a file: {d}")
 
         # ── Discover categories ────────────────────────────────────────────
-        sketch_cats = {d.name for d in self.sketch_root.iterdir() if d.is_dir()}
-        photo_cats  = {d.name for d in self.photo_root.iterdir()  if d.is_dir()}
-        found_cats  = sorted(sketch_cats & photo_cats)
+        try:
+            sketch_cats = {d.name for d in self.sketch_root.iterdir() if d.is_dir()}
+            photo_cats  = {d.name for d in self.photo_root.iterdir()  if d.is_dir()}
+        except PermissionError as e:
+            raise PermissionError(f"Cannot read dataset directory: {e}") from e
 
-        if not found_cats:
+        found = sorted(sketch_cats & photo_cats)
+        if not found:
             raise RuntimeError(
-                "No matching category folders found between sketch/ and photo/."
+                f"No matching category folders found.\n"
+                f"  sketch/ has: {sorted(sketch_cats)}\n"
+                f"  photo/  has: {sorted(photo_cats)}\n"
+                f"  They must share at least one folder name."
             )
 
         if categories is not None:
-            # Filter to requested categories
-            missing = set(categories) - set(found_cats)
+            missing = set(categories) - set(found)
             if missing:
-                print(f"  [Dataset] Warning: categories not found: {missing}")
-            self.categories = [c for c in categories if c in found_cats]
+                print(f"  [Dataset] Warning: requested categories not found: {sorted(missing)}")
+            self.categories = [c for c in categories if c in found]
+            if not self.categories:
+                raise RuntimeError(
+                    f"None of the requested categories exist: {categories}\n"
+                    f"  Available: {found}"
+                )
         else:
-            self.categories = found_cats
+            self.categories = found
 
-        # ── Build paired list ─────────────────────────────────────────────
+        # ── Build pairs ────────────────────────────────────────────────────
         self.pairs: List[Tuple[Path, Path, str]] = []
-        self.category_counts: Dict[str, int] = {}
+        self.cat_counts: Dict[str, int] = {}
+        skipped_cats = []
 
         for cat in self.categories:
-            sketch_dir = self.sketch_root / cat
-            photo_dir  = self.photo_root  / cat
+            try:
+                sk_map = self._index_folder(self.sketch_root / cat)
+                ph_map = self._index_folder(self.photo_root  / cat)
+            except Exception as e:
+                print(f"  [Dataset] Warning: could not read category '{cat}': {e}")
+                skipped_cats.append(cat)
+                continue
 
-            sketch_map = self._index_folder(sketch_dir)
-            photo_map  = self._index_folder(photo_dir)
+            if not sk_map:
+                print(f"  [Dataset] Warning: no images in sketch/{cat}/ — skipping.")
+                skipped_cats.append(cat)
+                continue
+            if not ph_map:
+                print(f"  [Dataset] Warning: no images in photo/{cat}/ — skipping.")
+                skipped_cats.append(cat)
+                continue
 
-            # Strategy 1: pair by same filename stem
-            common = sorted(set(sketch_map) & set(photo_map))
-
+            common = sorted(set(sk_map) & set(ph_map))
             if common:
                 for stem in common:
-                    self.pairs.append((sketch_map[stem], photo_map[stem], cat))
+                    self.pairs.append((sk_map[stem], ph_map[stem], cat))
             else:
-                # Strategy 2: pair by sorted order (different filenames)
-                sk_list = sorted(sketch_map.values())
-                ph_list = sorted(photo_map.values())
+                # Fallback: pair by sorted order
+                sk_list = sorted(sk_map.values())
+                ph_list = sorted(ph_map.values())
                 n = min(len(sk_list), len(ph_list))
                 for i in range(n):
                     self.pairs.append((sk_list[i], ph_list[i], cat))
 
-            cat_count = len([p for p in self.pairs if p[2] == cat])
-            self.category_counts[cat] = cat_count
+            self.cat_counts[cat] = len([p for p in self.pairs if p[2] == cat])
+
+        if skipped_cats:
+            print(f"  [Dataset] Skipped {len(skipped_cats)} categories: {skipped_cats}")
+
+        if not self.pairs:
+            raise RuntimeError(
+                "Dataset is empty — no valid sketch/photo pairs found.\n"
+                f"  Checked: {self.data_dir}"
+            )
 
         self._print_summary()
 
-        # ── Transforms ────────────────────────────────────────────────────
         self.sketch_tf = transforms.Compose([
             transforms.Resize((img_size, img_size), antialias=True),
-            transforms.ToTensor(),                                # [0, 1]
+            transforms.ToTensor(),
         ])
         self.photo_tf = transforms.Compose([
             transforms.Resize((img_size, img_size), antialias=True),
             transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # [-1, 1]
+            transforms.Normalize([0.5]*3, [0.5]*3),
         ])
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _index_folder(folder: Path) -> Dict[str, Path]:
-        """Returns {stem: path} for all images in folder."""
-        return {
-            p.stem: p
-            for p in folder.iterdir()
-            if p.suffix.lower() in IMAGE_EXTENSIONS
-        }
+        try:
+            return {
+                p.stem: p for p in folder.iterdir()
+                if p.suffix.lower() in IMAGE_EXTENSIONS and p.is_file()
+            }
+        except PermissionError as e:
+            raise PermissionError(f"Cannot read folder '{folder}': {e}") from e
 
     def _print_summary(self):
         print(f"\n[SketchPhotoDataset] Summary:")
@@ -254,74 +224,114 @@ class SketchPhotoDataset(Dataset):
         print(f"  Augment     : {self.augment}")
         print(f"  {'Category':<20} {'Pairs':>6}")
         print(f"  {'-'*28}")
-        for cat, count in self.category_counts.items():
+        for cat, count in self.cat_counts.items():
             print(f"  {cat:<20} {count:>6}")
         print()
 
-    def _random_hflip(
-        self, sk: np.ndarray, ph: Image.Image
-    ) -> Tuple[np.ndarray, Image.Image]:
-        import random
-        if random.random() < 0.5:
-            sk = sk[:, ::-1, :].copy()
-            ph = ph.transpose(Image.FLIP_LEFT_RIGHT)
-        return sk, ph
-
-    # ── Dataset interface ─────────────────────────────────────────────────────
-
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, idx: int) -> dict:
         sketch_path, photo_path, category = self.pairs[idx]
 
-        # Load
-        sketch = Image.open(sketch_path).convert("RGB")
-        photo  = Image.open(photo_path).convert("RGB")
+        # ── Load images with clear error messages ──────────────────────────
+        try:
+            sketch = Image.open(sketch_path).convert("RGB")
+        except UnidentifiedImageError:
+            raise IOError(
+                f"Corrupt or unreadable sketch image: '{sketch_path}'\n"
+                f"  Delete or replace this file and restart."
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Sketch file missing: '{sketch_path}'")
+        except Exception as e:
+            raise IOError(f"Error loading sketch '{sketch_path}': {e}") from e
 
-        # Resize sketch to numpy (for structure extraction + augmentation)
-        sketch_np = np.array(
-            sketch.resize((self.img_size, self.img_size), Image.BICUBIC)
-        )
+        try:
+            photo = Image.open(photo_path).convert("RGB")
+        except UnidentifiedImageError:
+            raise IOError(
+                f"Corrupt or unreadable photo image: '{photo_path}'\n"
+                f"  Delete or replace this file and restart."
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Photo file missing: '{photo_path}'")
+        except Exception as e:
+            raise IOError(f"Error loading photo '{photo_path}': {e}") from e
 
-        # Augmentation (applied to both consistently)
+        # ── Resize sketch to numpy ─────────────────────────────────────────
+        try:
+            sketch_np = np.array(
+                sketch.resize((self.img_size, self.img_size), Image.BICUBIC)
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to resize sketch '{sketch_path}': {e}") from e
+
+        # ── Augmentation ───────────────────────────────────────────────────
         if self.augment:
-            sketch_np, photo = self._random_hflip(sketch_np, photo)
-            if self.augmentor:
-                sketch_np = self.augmentor(sketch_np)
+            try:
+                if np.random.random() < 0.5:
+                    sketch_np = sketch_np[:, ::-1, :].copy()
+                    photo     = photo.transpose(Image.FLIP_LEFT_RIGHT)
+                if self.augmentor:
+                    sketch_np = self.augmentor(sketch_np)
+            except Exception as e:
+                # Augmentation failure is non-fatal
+                pass
 
-        sketch_pil = Image.fromarray(sketch_np)
+        try:
+            sketch_pil = Image.fromarray(sketch_np)
+        except Exception as e:
+            sketch_pil = sketch.resize((self.img_size, self.img_size))
 
-        # ── Structure maps ────────────────────────────────────────────────
+        # ── Structure maps ─────────────────────────────────────────────────
         if self.extractor is not None:
-            structure = self.extractor.extract(
-                sketch_np, target_size=(self.img_size, self.img_size)
-            )                                          # (5, H, W) float [0,1]
+            try:
+                structure = self.extractor.extract(
+                    sketch_np, (self.img_size, self.img_size)
+                )
+            except Exception as e:
+                # Structure extraction failure → fallback silently
+                st = transforms.ToTensor()(sketch_pil)
+                structure = torch.cat([
+                    st, torch.zeros(2, self.img_size, self.img_size)
+                ], dim=0)
         else:
-            # Fallback: duplicate sketch channels (3ch) + two zero channels
-            st = transforms.ToTensor()(sketch_pil)    # (3, H, W)
+            st = transforms.ToTensor()(sketch_pil)
             structure = torch.cat([
-                st,
-                torch.zeros(2, self.img_size, self.img_size)
-            ], dim=0)                                  # (5, H, W)
+                st, torch.zeros(2, self.img_size, self.img_size)
+            ], dim=0)
 
-        # ── Caption ───────────────────────────────────────────────────────
-        if self.caption_mode == "auto":
-            caption = build_caption(category)
-        else:
+        # ── Caption ────────────────────────────────────────────────────────
+        try:
+            caption = build_caption(category) if self.caption_mode == "auto" \
+                      else self.fixed_caption
+        except Exception:
             caption = self.fixed_caption
 
+        # ── Tensor conversion ──────────────────────────────────────────────
+        try:
+            sketch_tensor = self.sketch_tf(sketch_pil)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to convert sketch to tensor at index {idx}: {e}"
+            ) from e
+
+        try:
+            photo_tensor  = self.photo_tf(photo)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to convert photo to tensor at index {idx}: {e}"
+            ) from e
+
         return {
-            "sketch":    self.sketch_tf(sketch_pil),  # (3, H, W) [0, 1]
-            "photo":     self.photo_tf(photo),         # (3, H, W) [-1, 1]
-            "structure": structure,                    # (5, H, W) [0, 1]
+            "sketch":    sketch_tensor,
+            "photo":     photo_tensor,
+            "structure": structure,
             "caption":   caption,
             "category":  category,
             "stem":      sketch_path.stem,
         }
-
-    def get_categories(self) -> List[str]:
-        return list(self.categories)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -329,73 +339,86 @@ class SketchPhotoDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_dataloader(
-    data_dir:       str,
-    img_size:       int  = 256,
-    batch_size:     int  = 4,
-    num_workers:    int  = 4,
-    extractor:      Optional[StructureExtractor] = None,
-    categories:     Optional[List[str]] = None,
-    augment:        bool = True,
-    caption_mode:   str  = "auto",
-    shuffle:        bool = True,
+    data_dir:      str,
+    img_size:      int  = 256,
+    batch_size:    int  = 4,
+    num_workers:   int  = 2,
+    extractor:     Optional[StructureExtractor] = None,
+    categories:    Optional[List[str]] = None,
+    augment:       bool = True,
+    caption_mode:  str  = "auto",
+    shuffle:       bool = True,
 ) -> DataLoader:
-    """
-    Build a DataLoader for your category-structured dataset.
+    """Build DataLoader with validation."""
 
-    Parameters
-    ----------
-    data_dir     : path to dataset root (with sketch/ and photo/ subfolders)
-    img_size     : 256 for your dataset
-    batch_size   : 4 recommended for 12GB VRAM (SGLDv2 uses less memory)
-    categories   : list of specific categories; None = all
-    augment      : apply SketchAugmentor
-    """
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(f"data_dir not found: '{data_dir}'")
+
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+
+    if img_size < 16:
+        raise ValueError(f"img_size must be >= 16, got {img_size}")
+
+    # Build dataset
     dataset = SketchPhotoDataset(
-        data_dir      = data_dir,
-        img_size      = img_size,
-        extractor     = extractor,
-        categories    = categories,
-        augment       = augment,
-        caption_mode  = caption_mode,
+        data_dir     = data_dir,
+        img_size     = img_size,
+        extractor    = extractor,
+        categories   = categories,
+        augment      = augment,
+        caption_mode = caption_mode,
     )
+
+    # Clamp num_workers to available CPUs
+    import multiprocessing
+    max_workers = multiprocessing.cpu_count()
+    if num_workers > max_workers:
+        print(f"  [DataLoader] Clamping num_workers from {num_workers} "
+              f"to {max_workers} (system max).")
+        num_workers = max_workers
+
     return DataLoader(
         dataset,
-        batch_size   = batch_size,
-        shuffle      = shuffle,
-        num_workers  = num_workers,
-        pin_memory   = True,
-        drop_last    = True,
+        batch_size  = batch_size,
+        shuffle     = shuffle,
+        num_workers = num_workers,
+        pin_memory  = torch.cuda.is_available(),
+        drop_last   = True,
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Quick sanity check
+# Quick test
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
-
     data_dir = sys.argv[1] if len(sys.argv) > 1 else "./dataset"
-    print(f"Testing dataset at: {data_dir}\n")
+    print(f"Testing dataset: {data_dir}")
 
-    loader = build_dataloader(
-        data_dir    = data_dir,
-        img_size    = 256,
-        batch_size  = 4,
-        extractor   = None,      # skip structure extraction for quick test
-        augment     = False,
-    )
+    try:
+        loader = build_dataloader(
+            data_dir, batch_size=4, extractor=None, augment=False
+        )
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"[Error] {e}")
+        sys.exit(1)
 
-    batch = next(iter(loader))
+    try:
+        batch = next(iter(loader))
+    except StopIteration:
+        print("[Error] Dataset is empty.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[Error] Failed to load first batch: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
-    print("Batch contents:")
-    print(f"  sketch    : {batch['sketch'].shape}    "
+    print(f"sketch    : {batch['sketch'].shape}    "
           f"[{batch['sketch'].min():.2f}, {batch['sketch'].max():.2f}]")
-    print(f"  photo     : {batch['photo'].shape}     "
+    print(f"photo     : {batch['photo'].shape}     "
           f"[{batch['photo'].min():.2f}, {batch['photo'].max():.2f}]")
-    print(f"  structure : {batch['structure'].shape} "
-          f"[{batch['structure'].min():.2f}, {batch['structure'].max():.2f}]")
-    print(f"  caption   : {batch['caption'][0]}")
-    print(f"  category  : {batch['category']}")
-    print(f"  stem      : {batch['stem']}")
-    print("\n Dataset loader working correctly.")
+    print(f"structure : {batch['structure'].shape}")
+    print(f"caption   : {batch['caption'][0]}")
+    print(f"category  : {batch['category'][0]}")
+    print("\nDataset OK.")
