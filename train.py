@@ -124,7 +124,7 @@ def parse_args() -> argparse.Namespace:
                    help="Weight for CLIP perceptual loss (0 = disable)")
 
     # Infrastructure
-    p.add_argument("--num_workers",     type=int, default=4)
+    p.add_argument("--num_workers",     type=int, default=2)
     p.add_argument("--seed",            type=int, default=42)
     p.add_argument("--mixed_precision", type=str, default="fp16",
                    choices=["no", "fp16", "bf16"])
