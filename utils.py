@@ -328,16 +328,38 @@ def load_config(output_dir: str) -> Dict[str, Any]:
 def edge_map_np(img_np: np.ndarray) -> np.ndarray:
     """
     Canny edge map from HxWx3 uint8 → HxW float32 [0,1].
-    Falls back to Sobel → zeros on failure.
+    Uses sketch-aware thresholds — same logic as StructureExtractor.
+    Falls back to zeros on failure.
     """
     try:
         import cv2
-        gray  = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
+        gray   = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        median = float(np.median(gray))
+
+        # Sketch-aware thresholds
+        # Sketches have white background (median > 200): need LOW thresholds
+        # Fixed lo=50,hi=150 would fail completely on bright-background sketches
+        if median > 200:
+            lo, hi = 30, 100
+        elif median < 30:
+            lo, hi = 10, 50
+        else:
+            lo = int(max(10,  0.33 * median))
+            hi = int(min(250, 1.00 * median))
+            if hi - lo < 20:
+                lo = max(10, hi - 40)
+
+        edges = cv2.Canny(gray, lo, hi)
+
+        # Relax if empty
+        if edges.sum() == 0:
+            edges = cv2.Canny(gray, max(5, lo // 3), max(30, hi // 2))
+
         return (edges / 255.0).astype(np.float32)
+
     except ImportError:
-        print("  [edge_map_np] OpenCV not available.")
+        print("  [edge_map_np] OpenCV not available — pip install opencv-python")
         return np.zeros(img_np.shape[:2], dtype=np.float32)
     except Exception as e:
-        print(f"  [edge_map_np] Canny failed ({e}) — returning zeros.")
+        print(f"  [edge_map_np] Failed ({e}) — returning zeros.")
         return np.zeros(img_np.shape[:2], dtype=np.float32)

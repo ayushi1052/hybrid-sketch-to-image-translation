@@ -75,22 +75,46 @@ class StructureExtractor:
 
     def get_edge_map(self, img_np: np.ndarray) -> np.ndarray:
         """
-        Canny edge detection with adaptive thresholds.
+        Canny edge detection with sketch-aware thresholds.
         Falls back to Sobel → grayscale on failure.
+
+        Key fix: sketches have white backgrounds (median ~240), so adaptive
+        thresholds based on median completely miss the dark sketch lines.
+        We detect sketch vs photo and use appropriate thresholds for each.
+
         img_np : HxWx3 uint8
         returns: HxW float32 [0,1]
         """
-        # Primary: Canny
         try:
             gray   = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-            median = np.median(gray)
-            lo     = int(max(0,   0.67 * median))
-            hi     = int(min(255, 1.33 * median))
-            # Avoid degenerate case where lo == hi
-            if lo == hi:
-                lo, hi = 50, 150
-            edges  = cv2.Canny(gray, lo, hi)
+            median = float(np.median(gray))
+
+            # ── Sketch-aware threshold selection ──────────────────────────
+            # Sketches: bright background (median > 200), sparse dark lines.
+            #   Photo-style adaptive thresholds give lo≈160, hi≈255
+            #   which finds NO edges at all on sketches.
+            # Photos: varied content, median usually 80-180.
+            if median > 200:
+                # Sketch mode — low fixed thresholds to catch thin dark lines
+                lo, hi = 30, 100
+            elif median < 30:
+                # Very dark image
+                lo, hi = 10, 50
+            else:
+                # Photo mode — thresholds relative to content brightness
+                lo = int(max(10,  0.33 * median))
+                hi = int(min(250, 1.00 * median))
+                if hi - lo < 20:
+                    lo = max(10, hi - 40)
+
+            edges = cv2.Canny(gray, lo, hi)
+
+            # Safety: if result is empty, relax thresholds once
+            if edges.sum() == 0:
+                edges = cv2.Canny(gray, max(5, lo // 3), max(30, hi // 2))
+
             return (edges / 255.0).astype(np.float32)
+
         except cv2.error as e:
             print(f"  [Edge] Canny failed ({e}) — trying Sobel fallback.")
         except Exception as e:
