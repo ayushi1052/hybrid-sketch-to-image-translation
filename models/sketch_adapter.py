@@ -107,19 +107,25 @@ class SketchTokenEncoder(nn.Module):
         """
         B = structure_maps.shape[0]
 
+        # ── Fix: cast input to match Conv2d weight dtype ──────────────────
+        # Mixed precision (fp16) sends fp16 tensors but model weights may
+        # still be fp32 until accelerator casts them. Always align dtypes.
+        target_dtype = self.patch_embed[0].weight.dtype
+        structure_maps = structure_maps.to(dtype=target_dtype)
+
         # 1. Patchify + embed
         x = self.patch_embed(structure_maps)                    # (B, dim, h, w)
         x = x.flatten(2).permute(0, 2, 1)                      # (B, n_patches, dim)
 
         # 2. Add positional encoding
-        x = x + self.pos_embed
+        x = x + self.pos_embed.to(dtype=target_dtype)
 
         # 3. Transformer encoder
         x = self.transformer(x)                                 # (B, n_patches, dim)
 
         # 4. Cross-attend query tokens against patch tokens
         #    → compress variable-length patches to fixed num_tokens
-        q = self.query_tokens.expand(B, -1, -1)                # (B, num_tokens, dim)
+        q = self.query_tokens.expand(B, -1, -1).to(dtype=target_dtype)  # (B, num_tokens, dim)
         q = self.query_norm(q)
         tokens, _ = self.query_attn(q, x, x)                   # (B, num_tokens, dim)
 
