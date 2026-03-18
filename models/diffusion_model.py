@@ -179,9 +179,8 @@ class SGLDv2Model(nn.Module):
         noise_pred : (B, 4, H/8, W/8)
         """
         # 1. Encode structure maps → sketch tokens
-        sketch_tokens = self.sketch_adapter.encode(
-            structure_maps.to(dtype=self.dtype)
-        )                                              # (B, num_tokens, 768)
+        #    (SketchAdapter handles dtype casting internally)
+        sketch_tokens = self.sketch_adapter.encode(structure_maps)
 
         # 2. Store tokens in injected attention layers
         self.sketch_adapter.set_sketch_tokens(self.unet, sketch_tokens)
