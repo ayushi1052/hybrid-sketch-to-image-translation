@@ -1,0 +1,26 @@
+# Modified d-Sketch — Sketch to Realistic Photo
+# pip install -r requirements.txt
+
+# ── Core ───────────────────────────────────────────────────────────────────
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ── HuggingFace ────────────────────────────────────────────────────────────
+diffusers>=0.27.0
+transformers>=4.38.0      # CLIPVisionModel, CLIPImageProcessor
+accelerate>=0.28.0
+safetensors>=0.4.0
+
+# ── Attention acceleration ─────────────────────────────────────────────────
+xformers>=0.0.23          # faster attention, less VRAM
+
+# ── Image processing ───────────────────────────────────────────────────────
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# ── Demo UI ────────────────────────────────────────────────────────────────
+gradio>=4.20.0
+
+# ── Utilities ──────────────────────────────────────────────────────────────
+tqdm>=4.66.0
