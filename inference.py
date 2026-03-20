@@ -137,6 +137,8 @@ def run_generate(
             "GPU OOM. Try: --steps 20 or --device cpu"
         )
     except Exception as e:
+        # Print full traceback so we can see exactly which line fails
+        traceback.print_exc()
         raise RuntimeError(f"Generation failed: {e}") from e
 
 

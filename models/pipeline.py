@@ -442,7 +442,6 @@ class SketchToImagePipeline(nn.Module):
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    @torch.inference_mode()
     def generate(
         self,
         sketch_pil:         Image.Image,
@@ -452,96 +451,129 @@ class SketchToImagePipeline(nn.Module):
     ) -> Tuple[Image.Image, Image.Image]:
         """
         Sketch → (output_photo, colored_edge_map_preview)
-
-        No text prompt needed — colored edge map provides all conditioning.
-
-        guidance_scale : CFG scale. 1.0 = no guidance, 3-5 = recommended.
-                         Lower than standard SD (7.5) because image conditioning
-                         already provides strong structural signal.
+        No text prompt needed.
         """
         from torchvision import transforms
 
-        # ── Preprocess sketch ──────────────────────────────────────────────
+        use_autocast = (self.device == "cuda")
+
+        # ── Trainable models always fp32 (BatchNorm requires it) ──────────
+        self.lctn.float()
+        self.edge_gen.float()
+        self.cond_proj.float()
+
+        # ── Preprocess sketch → fp32 tensor ───────────────────────────────
         tf = transforms.Compose([
             transforms.Resize((self.img_size, self.img_size)),
             transforms.ToTensor(),
             transforms.Normalize([0.5]*3, [0.5]*3),
         ])
-        sketch_t = tf(sketch_pil.convert("RGB")).unsqueeze(0).to(self.device)
+        sketch_t = (tf(sketch_pil.convert("RGB"))
+                    .unsqueeze(0)
+                    .to(device=self.device, dtype=torch.float32))
 
-        # ── Step 1: Encode sketch → latent ────────────────────────────────
-        sketch_latent = self.vae_encode(sketch_t)           # (1,4,H//8,W//8)
+        # ── Step 1: VAE encode sketch ──────────────────────────────────────
+        # VAE may be fp16 or fp32 — autocast handles it
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda",
+                                dtype=torch.float16,
+                                enabled=use_autocast):
+                vae_in = sketch_t.to(dtype=next(self.vae.parameters()).dtype)
+                dist   = self.vae.encode(vae_in).latent_dist
+                sketch_latent = dist.sample() * self.vae.config.scaling_factor
+        # Bring back to fp32 for LCTN
+        sketch_latent = sketch_latent.float()
 
-        # ── Step 2: LCTN → translated image latent ────────────────────────
-        image_latent  = self.lctn(sketch_latent)            # (1,4,H//8,W//8)
+        # ── Step 2: LCTN → image latent (fp32) ────────────────────────────
+        with torch.no_grad():
+            image_latent = self.lctn(sketch_latent).float()
 
-        # ── Step 3: ColoredEdgeGenerator → colored map ────────────────────
-        pred_colored  = self.edge_gen(sketch_t)             # (1,3,H,W)
+        # ── Step 3: ColoredEdgeGenerator → colored map (fp32) ────────────
+        with torch.no_grad():
+            pred_colored = self.edge_gen(sketch_t).float()
 
-        # ── Step 4: Encode colored map → conditioning ─────────────────────
-        clip_feats    = self.encode_conditioning(pred_colored)
-        conditioning  = self.cond_proj(
-            clip_feats.to(dtype=self.cond_proj.dim_proj.weight.dtype)
-        )                                                   # (1, 77, 768)
+        # ── Step 4: CLIP encode colored map (fp32 output) ─────────────────
+        with torch.no_grad():
+            clip_feats   = self.encode_conditioning(pred_colored).float()
+            conditioning = self.cond_proj(clip_feats).float()     # (1, 77, 768)
 
-        # Null conditioning for CFG (empty-like — zeroed out)
-        null_cond     = torch.zeros_like(conditioning)
-        combined_cond = torch.cat([null_cond, conditioning])  # (2, 77, 768)
-
-        # ── Step 5: Add k steps of noise + partial denoise ────────────────
+        # ── Step 5: Setup scheduler + noisy latent ─────────────────────────
         T    = self.scheduler.config.num_train_timesteps
         k    = int(self.k_ratio * T)
 
-        # Use UniPC for fast inference (fewer steps needed)
-        infer_scheduler = UniPCMultistepScheduler.from_config(
+        infer_sched = UniPCMultistepScheduler.from_config(
             self.scheduler.config
         )
-        infer_scheduler.set_timesteps(num_steps)
+        infer_sched.set_timesteps(num_steps)
 
-        # Add k-level noise to image latent
-        generator   = torch.Generator(device=self.device).manual_seed(seed)
-        noise       = torch.randn_like(image_latent, generator=generator)
-        timestep_k  = torch.tensor([k], device=self.device).long()
-        noisy_latent = infer_scheduler.add_noise(image_latent, noise, timestep_k)
-        latents      = noisy_latent.to(dtype=self.dtype)
+        gen          = torch.Generator(device=self.device).manual_seed(seed)
+        noise        = torch.randn_like(image_latent, generator=gen)
+        timestep_k   = torch.tensor([k], device=self.device).long()
 
-        # Only run denoising steps from k onwards (not full T)
+        # add_noise always works in fp32
+        noisy_latent = infer_sched.add_noise(
+            image_latent.float(),
+            noise.float(),
+            timestep_k,
+        ).float()
+
         start_step   = int((1 - self.k_ratio) * num_steps)
-        active_steps = infer_scheduler.timesteps[start_step:]
+        active_steps = infer_sched.timesteps[start_step:]
 
-        # ── Denoising loop ────────────────────────────────────────────────
-        for t in active_steps:
-            lat_in     = torch.cat([latents] * 2)
-            lat_in     = infer_scheduler.scale_model_input(lat_in, t)
+        # ── Step 6: Denoising loop ─────────────────────────────────────────
+        # Use autocast so UNet can use fp16 internally without manual casting
+        unet_dtype   = next(self.unet.parameters()).dtype
+        latents      = noisy_latent
 
-            noise_pred = self.unet(
-                lat_in,
-                t,
-                encoder_hidden_states = combined_cond.to(dtype=self.dtype),
-            ).sample
+        with torch.no_grad():
+            # Pre-cast conditioning once to match UNet dtype
+            cond_unet = conditioning.to(dtype=unet_dtype)
+            null_cond = torch.zeros_like(cond_unet)
+            comb_cond = torch.cat([null_cond, cond_unet])   # (2, 77, 768)
 
-            # Classifier-free guidance
-            noise_uncond, noise_cond = noise_pred.chunk(2)
-            noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+            for t in active_steps:
+                lat_in = torch.cat([latents] * 2).to(dtype=unet_dtype)
+                lat_in = infer_sched.scale_model_input(lat_in, t)
 
-            latents = infer_scheduler.step(noise_pred, t, latents).prev_sample
+                with torch.autocast(device_type="cuda",
+                                    dtype=torch.float16,
+                                    enabled=use_autocast):
+                    noise_pred = self.unet(
+                        lat_in,
+                        t,
+                        encoder_hidden_states=comb_cond,
+                    ).sample.float()   # bring back to fp32 for scheduler
 
-        # ── Decode ────────────────────────────────────────────────────────
-        output_img   = self.vae_decode(latents)             # (1,3,H,W) [-1,1]
+                # CFG in fp32
+                u, c       = noise_pred.chunk(2)
+                noise_pred = u + guidance_scale * (c - u)
 
-        # Convert output to PIL
-        out_arr      = ((output_img[0].float().cpu() * 0.5 + 0.5)
-                        .clamp(0, 1)
-                        .permute(1, 2, 0)
-                        .numpy() * 255).astype("uint8")
-        output_pil   = Image.fromarray(out_arr)
+                # Scheduler step in fp32
+                latents = infer_sched.step(
+                    noise_pred, t, latents.float()
+                ).prev_sample.float()
 
-        # Convert colored map to PIL for display
-        col_arr      = ((pred_colored[0].float().cpu() * 0.5 + 0.5)
-                        .clamp(0, 1)
-                        .permute(1, 2, 0)
-                        .numpy() * 255).astype("uint8")
-        colored_pil  = Image.fromarray(col_arr)
+        # ── Step 7: VAE decode ─────────────────────────────────────────────
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda",
+                                dtype=torch.float16,
+                                enabled=use_autocast):
+                dec_in  = (latents / self.vae.config.scaling_factor
+                           ).to(dtype=next(self.vae.parameters()).dtype)
+                out_img = self.vae.decode(dec_in).sample.float()
+
+        # ── Convert to PIL ─────────────────────────────────────────────────
+        out_arr = ((out_img[0].cpu() * 0.5 + 0.5)
+                   .clamp(0, 1)
+                   .permute(1, 2, 0)
+                   .numpy() * 255).astype("uint8")
+        output_pil = Image.fromarray(out_arr)
+
+        col_arr = ((pred_colored[0].cpu() * 0.5 + 0.5)
+                   .clamp(0, 1)
+                   .permute(1, 2, 0)
+                   .numpy() * 255).astype("uint8")
+        colored_pil = Image.fromarray(col_arr)
 
         return output_pil, colored_pil
 
@@ -574,4 +606,11 @@ class SketchToImagePipeline(nn.Module):
             if miss:
                 print(f"  [CondProj] Missing : {miss}")
             print(f"  [Pipeline] CondProj loaded ← {cp_path}")
-        print(f"  [Pipeline] All components loaded ← {path}")
+
+        # Keep trainable models in fp32 — BatchNorm1d in LCTN requires fp32.
+        # Their outputs are cast to fp16 only when entering frozen SD models.
+        self.lctn.to(dtype=torch.float32)
+        self.edge_gen.to(dtype=torch.float32)
+        self.cond_proj.to(dtype=torch.float32)
+        print(f"  [Pipeline] All components loaded ← {path}  "
+              f"(trainable=fp32, frozen SD=fp16)")

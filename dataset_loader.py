@@ -90,19 +90,62 @@ def _index_folder(folder: Path) -> Dict[str, Path]:
         raise PermissionError(f"Cannot read '{folder}': {e}") from e
 
 
+def _normalize_stem(stem: str) -> str:
+    """
+    Strip sketch variant suffixes to get the base photo ID.
+
+    Your naming convention:
+      photo  : abc..10105          → base ID = abc..10105
+      sketch : abc..10105-1        → base ID = abc..10105
+      sketch : abc..10105-2        → base ID = abc..10105
+      sketch : abc..10105_1        → base ID = abc..10105
+
+    Matches your notebook logic:
+      stem.replace("-1", "").replace("_1", "")
+    But generalised to handle -2, -3, _2, _3 etc. as well.
+    """
+    # Remove trailing -N or _N suffix (any single digit variant number)
+    import re
+    return re.sub(r'[-_]\d+$', '', stem)
+
+
 def _pair_maps(
     sk_map: Dict[str, Path],
     ph_map: Dict[str, Path],
 ) -> List[Tuple[Path, Path]]:
-    common = sorted(set(sk_map) & set(ph_map))
-    if common:
-        return [(sk_map[s], ph_map[s]) for s in common]
-    sk_l = sorted(sk_map.values())
-    ph_l = sorted(ph_map.values())
-    n    = min(len(sk_l), len(ph_l))
-    if n < max(len(sk_l), len(ph_l)):
-        print(f"  [Dataset] Stem mismatch — pairing {n} pairs by sorted order.")
-    return list(zip(sk_l[:n], ph_l[:n]))
+    """
+    Match sketches to photos using normalized base IDs.
+
+    sketch stem : abc..10105-1  →  normalize  →  abc..10105
+    sketch stem : abc..10105-2  →  normalize  →  abc..10105
+    photo  stem : abc..10105    →  normalize  →  abc..10105  (unchanged)
+
+    All sketch variants correctly map to their one real photo.
+    """
+    # Build photo lookup: normalized_stem → photo_path
+    # Photos have no suffix so normalize is a no-op for them
+    photo_lookup: Dict[str, Path] = {}
+    for stem, path in ph_map.items():
+        norm = _normalize_stem(stem)
+        photo_lookup[norm] = path
+
+    pairs:     List[Tuple[Path, Path]] = []
+    unmatched: List[str]               = []
+
+    for sk_stem, sk_path in sk_map.items():
+        base_id = _normalize_stem(sk_stem)
+        if base_id in photo_lookup:
+            pairs.append((sk_path, photo_lookup[base_id]))
+        else:
+            unmatched.append(sk_stem)
+
+    if unmatched:
+        preview = unmatched[:3]
+        more    = f"... (+{len(unmatched)-3} more)" if len(unmatched) > 3 else ""
+        print(f"  [Dataset] {len(unmatched)} sketches had no matching photo: "
+              f"{preview}{more}")
+
+    return pairs
 
 
 def _discover_pairs(
