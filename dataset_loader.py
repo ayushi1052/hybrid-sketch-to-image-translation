@@ -105,8 +105,14 @@ def _normalize_stem(stem: str) -> str:
     But generalised to handle -2, -3, _2, _3 etc. as well.
     """
     # Remove trailing -N or _N suffix (any single digit variant number)
-    import re
-    return re.sub(r'[-_]\d+$', '', stem)
+   # remove extension (extra safety)
+    name = stem.split('.')[0]
+
+    # remove sketch suffix (-6, -3 etc.)
+    if '-' in name:
+        name = name.split('-')[0]
+
+    return name
 
 
 def _pair_maps(
