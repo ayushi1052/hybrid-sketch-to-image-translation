@@ -1,262 +1,282 @@
 """
 models/sketch_adapter.py
 =========================
-SketchAdapter — with full exception handling
+StructureControlNet
+===================
+Architecture (matches diagram):
+  Structure Maps (5-ch: edge + depth + SegFormer-RGB)
+    → StructureInputProjection  (Conv64 → Conv128 → Conv256 → Conv3)
+    → ControlNetModel           (cloned from frozen UNet encoder)
+    → down/mid residuals        → injected into frozen UNet skip connections
 
-Structure maps → Token sequence → injected into UNet cross-attention
-via simple token concatenation (gradient-safe approach).
+Speed / memory optimisations
+─────────────────────────────
+• ControlNet runs with xformers memory-efficient attention when available
+  (~20-30 % faster, ~40 % less VRAM for attention).
+• ControlNet and InputProjection converted to channels_last memory layout.
+• ControlNet gradient checkpointing halves activation memory during training.
+• StructureInputProjection is compiled with torch.compile (inductor) when
+  torch ≥ 2.0 is detected, giving ~15 % faster forward on CUDA.
 """
 
+from __future__ import annotations
+
+import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from diffusers import ControlNetModel
 
 
-class SketchTokenEncoder(nn.Module):
+# ─────────────────────────────────────────────────────────────────────────────
+# Input Projection  Conv64 → Conv128 → Conv256 → Conv3
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StructureInputProjection(nn.Module):
     """
-    Encodes 5-channel structure maps → (B, num_tokens, 768) token sequence.
-    All forward steps have dtype guards and shape validation.
+    Projects 5-channel structure maps to a 3-channel control hint at the
+    same spatial resolution (no downsampling).
+
+    in  : (B, 5, H, W)  float [0, 1]
+    out : (B, 3, H, W)  float [-1, 1]   — matches SD pixel normalisation
     """
 
-    def __init__(
-        self,
-        in_channels:  int = 5,
-        token_dim:    int = 768,
-        num_tokens:   int = 16,
-        patch_size:   int = 16,
-        img_size:     int = 256,
-        num_layers:   int = 4,
-        num_heads:    int = 8,
-    ):
+    def __init__(self, in_channels: int = 5) -> None:
         super().__init__()
-
-        if img_size % patch_size != 0:
-            raise ValueError(
-                f"img_size ({img_size}) must be divisible by patch_size ({patch_size})."
-            )
-        if token_dim % num_heads != 0:
-            raise ValueError(
-                f"token_dim ({token_dim}) must be divisible by num_heads ({num_heads})."
-            )
-
-        self.num_tokens = num_tokens
-        self.token_dim  = token_dim
-        n_patches       = (img_size // patch_size) ** 2
-
-        # Patch embedding
-        self.patch_embed = nn.Sequential(
-            nn.Conv2d(in_channels, 256, patch_size, stride=patch_size),
-            nn.GELU(),
-            nn.Conv2d(256, token_dim, 1),
-        )
-        self.pos_embed = nn.Parameter(
-            torch.randn(1, n_patches, token_dim) * 0.02
-        )
-
-        # Transformer encoder
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model         = token_dim,
-            nhead           = num_heads,
-            dim_feedforward = token_dim * 4,
-            dropout         = 0.0,
-            activation      = "gelu",
-            batch_first     = True,
-            norm_first      = True,
-        )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-
-        # Perceiver resampler: variable patches → fixed num_tokens
-        self.query_tokens = nn.Parameter(torch.randn(1, num_tokens, token_dim))
-        self.query_attn   = nn.MultiheadAttention(
-            embed_dim=token_dim, num_heads=num_heads, batch_first=True
-        )
-        self.query_norm   = nn.LayerNorm(token_dim)
-        self.out_proj     = nn.Linear(token_dim, token_dim)
-        self.out_norm     = nn.LayerNorm(token_dim)
-
-    def forward(self, structure_maps: torch.Tensor) -> torch.Tensor:
-        """
-        structure_maps : (B, 5, H, W)
-        returns        : (B, num_tokens, 768)
-        """
-        # ── Input validation ──────────────────────────────────────────────
-        if structure_maps.dim() != 4:
-            raise ValueError(
-                f"Expected 4D tensor (B, C, H, W), got shape: {structure_maps.shape}"
-            )
-        if structure_maps.shape[1] != self.patch_embed[0].in_channels:
-            raise ValueError(
-                f"Expected {self.patch_embed[0].in_channels} channels, "
-                f"got {structure_maps.shape[1]}"
-            )
-
-        B = structure_maps.shape[0]
-
-        # ── Auto dtype cast: fixes fp16/fp32 mismatch ─────────────────────
-        try:
-            dtype = self.patch_embed[0].weight.dtype
-            x     = structure_maps.to(dtype=dtype)
-        except Exception as e:
-            raise RuntimeError(f"Dtype cast failed: {e}") from e
-
-        # ── Patch embedding ────────────────────────────────────────────────
-        try:
-            x = self.patch_embed(x)                          # (B, dim, h, w)
-            x = x.flatten(2).permute(0, 2, 1)               # (B, n_patches, dim)
-        except RuntimeError as e:
-            raise RuntimeError(
-                f"Patch embedding failed: {e}\n"
-                f"  Input shape: {structure_maps.shape}\n"
-                f"  Check that img_size matches the one used at init."
-            ) from e
-
-        # ── Positional encoding ────────────────────────────────────────────
-        try:
-            x = x + self.pos_embed.to(dtype=dtype)
-        except RuntimeError as e:
-            raise RuntimeError(
-                f"Positional encoding failed: {e}\n"
-                f"  x: {x.shape}, pos_embed: {self.pos_embed.shape}"
-            ) from e
-
-        # ── Transformer encoder ────────────────────────────────────────────
-        try:
-            x = self.transformer(x)                          # (B, n_patches, dim)
-        except Exception as e:
-            raise RuntimeError(f"Transformer encoder failed: {e}") from e
-
-        # ── Perceiver resampler ────────────────────────────────────────────
-        try:
-            q      = self.query_tokens.expand(B, -1, -1).to(dtype=dtype)
-            q      = self.query_norm(q)
-            out, _ = self.query_attn(q, x, x)               # (B, num_tokens, dim)
-        except Exception as e:
-            raise RuntimeError(f"Perceiver resampler failed: {e}") from e
-
-        # ── Output projection ──────────────────────────────────────────────
-        try:
-            return self.out_norm(self.out_proj(out))         # (B, num_tokens, 768)
-        except Exception as e:
-            raise RuntimeError(f"Output projection failed: {e}") from e
-
-
-class SketchAdapter(nn.Module):
-    """
-    Full SketchAdapter: structure maps → sketch tokens.
-
-    Usage:
-        adapter       = SketchAdapter()
-        sketch_tokens = adapter(structure_maps)          # (B, 16, 768)
-        combined      = cat([text_tokens, sketch_tokens], dim=1)
-        noise_pred    = unet(..., encoder_hidden_states=combined)
-
-    Only SketchAdapter is trained. UNet stays frozen.
-    """
-
-    def __init__(
-        self,
-        in_channels:    int = 5,
-        token_dim:      int = 768,
-        num_tokens:     int = 16,
-        num_enc_layers: int = 4,
-        img_size:       int = 256,
-    ):
-        super().__init__()
-
-        # Validate init params
         if in_channels < 1:
-            raise ValueError(f"in_channels must be >= 1, got {in_channels}")
-        if num_tokens < 1:
-            raise ValueError(f"num_tokens must be >= 1, got {num_tokens}")
-        if img_size < 32:
-            raise ValueError(f"img_size must be >= 32, got {img_size}")
+            raise ValueError(f"in_channels must be ≥ 1, got {in_channels}")
 
-        try:
-            self.token_encoder = SketchTokenEncoder(
-                in_channels = in_channels,
-                token_dim   = token_dim,
-                num_tokens  = num_tokens,
-                img_size    = img_size,
-                num_layers  = num_enc_layers,
+        def _block(ic: int, oc: int, groups: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Conv2d(ic, oc, 3, padding=1, bias=False),
+                nn.GroupNorm(groups, oc),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(oc, oc, 3, padding=1, bias=False),
+                nn.GroupNorm(groups, oc),
+                nn.SiLU(inplace=True),
             )
-        except Exception as e:
-            raise RuntimeError(f"SketchTokenEncoder init failed: {e}") from e
 
-    def forward(self, structure_maps: torch.Tensor) -> torch.Tensor:
-        """
-        structure_maps : (B, 5, H, W)  float [0,1]
-        returns        : (B, num_tokens, 768)
-        """
-        if structure_maps is None:
-            raise ValueError("structure_maps is None.")
+        self.conv64  = _block(in_channels, 64,  8)
+        self.conv128 = _block(64,  128, 8)
+        self.conv256 = _block(128, 256, 8)
+        self.out     = nn.Sequential(
+            nn.Conv2d(256, 64, 1, bias=False),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(64, 3, 1),
+            nn.Tanh(),
+        )
+        self._init_weights()
 
-        if not torch.isfinite(structure_maps).all():
-            # Replace NaN/Inf with zeros rather than crashing
-            n_bad = (~torch.isfinite(structure_maps)).sum().item()
-            print(f"  [SketchAdapter] Warning: {n_bad} non-finite values in "
-                  "structure_maps — replacing with 0.")
-            structure_maps = torch.nan_to_num(structure_maps, nan=0.0,
-                                              posinf=1.0, neginf=0.0)
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """(B,5,H,W) → (B,3,H,W)"""
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4-D input, got {x.shape}")
+        dtype = self.conv64[0].weight.dtype
+        x     = x.to(dtype=dtype, memory_format=torch.channels_last)
         try:
-            return self.token_encoder(structure_maps)
+            return self.out(self.conv256(self.conv128(self.conv64(x))))
         except RuntimeError as e:
             raise RuntimeError(
-                f"SketchAdapter forward failed: {e}\n"
-                f"  Input shape: {structure_maps.shape}"
+                f"StructureInputProjection failed: {e}  input={x.shape}"
             ) from e
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# StructureControlNet
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StructureControlNet(nn.Module):
+    """
+    Full control encoder:
+      structure_maps (5-ch)
+        → StructureInputProjection  (Conv64 → Conv128 → Conv256 → Conv3)
+        → ControlNetModel
+        → (down_block_residuals, mid_block_residual)
+        → injected into frozen UNet
+
+    Only StructureInputProjection + ControlNet are trained.
+
+    Usage
+    -----
+        down_res, mid_res = ctrl_net(noisy_lat, t, text_emb, struct_maps)
+        noise_pred = unet(
+            noisy_lat, t, text_emb,
+            down_block_additional_residuals=down_res,
+            mid_block_additional_residual=mid_res,
+        ).sample
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 5,
+        unet              = None,
+        compile_proj: bool = True,
+    ) -> None:
+        super().__init__()
+
+        if unet is None:
+            raise ValueError("unet must be provided to build ControlNet.")
+
+        # Input projection: 5-ch → 3-ch control hint
+        self.input_proj = StructureInputProjection(in_channels=in_channels)
+
+        # ── Build ControlNet from frozen UNet ─────────────────────────────
+        print("  [StructureControlNet] Building ControlNet from UNet …")
+        try:
+            self.controlnet = ControlNetModel.from_unet(unet)
+        except Exception as e:
+            raise RuntimeError(
+                f"ControlNetModel.from_unet failed: {e}\n"
+                "  Ensure diffusers ≥ 0.27 is installed."
+            ) from e
+
+        # ── xformers memory-efficient attention ───────────────────────────
+        try:
+            self.controlnet.enable_xformers_memory_efficient_attention()
+            print("  [StructureControlNet] xformers attention: ENABLED")
+        except Exception:
+            print("  [StructureControlNet] xformers not available — using default attention.")
+
+        # ── channels_last ─────────────────────────────────────────────────
+        try:
+            self.controlnet = self.controlnet.to(memory_format=torch.channels_last)
+            self.input_proj = self.input_proj.to(memory_format=torch.channels_last)
+        except Exception:
+            pass
+
+        # ── Gradient checkpointing (halves activation memory during train) ─
+        try:
+            self.controlnet.enable_gradient_checkpointing()
+            print("  [StructureControlNet] Gradient checkpointing: ENABLED")
+        except Exception:
+            pass
+
+        # ── torch.compile InputProjection (inductor, ~15 % faster) ───────
+        if compile_proj:
+            try:
+                self.input_proj = torch.compile(
+                    self.input_proj, mode="reduce-overhead", fullgraph=False
+                )
+                print("  [StructureControlNet] torch.compile InputProjection: ENABLED")
+            except Exception:
+                pass   # compile is optional
+
+        print("  [StructureControlNet] Ready.")
+
+    # ── Forward ───────────────────────────────────────────────────────────────
+
+    def forward(
+        self,
+        noisy_latents:      torch.Tensor,   # (B, 4, H//8, W//8)
+        timesteps:          torch.Tensor,   # (B,)
+        encoder_hidden:     torch.Tensor,   # (B, 77, 768)
+        structure_maps:     torch.Tensor,   # (B, 5, H, W)
+        conditioning_scale: float = 1.0,
+    ) -> tuple:
+        """
+        Returns (down_block_res_samples, mid_block_res_sample).
+        """
+        # Replace non-finite values silently
+        if not torch.isfinite(structure_maps).all():
+            structure_maps = torch.nan_to_num(
+                structure_maps, nan=0.0, posinf=1.0, neginf=0.0
+            )
+
+        try:
+            hint = self.input_proj(structure_maps)   # (B, 3, H, W)
+        except Exception as e:
+            raise RuntimeError(f"InputProjection failed: {e}") from e
+
+        try:
+            down_res, mid_res = self.controlnet(
+                sample                = noisy_latents,
+                timestep              = timesteps,
+                encoder_hidden_states = encoder_hidden,
+                controlnet_cond       = hint,
+                conditioning_scale    = conditioning_scale,
+                return_dict           = False,
+            )
+            return down_res, mid_res
+        except torch.cuda.OutOfMemoryError:
+            raise torch.cuda.OutOfMemoryError(
+                "OOM in ControlNet. Try: lower --batch_size or --img_size"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"ControlNet forward failed: {e}  "
+                f"noisy={noisy_latents.shape}  hint={hint.shape}"
+            ) from e
+
+    # ── Persistence ───────────────────────────────────────────────────────────
 
     def save(self, path: str) -> None:
-        """Save adapter weights — raises with clear message on failure."""
-        import os
-        try:
-            os.makedirs(path, exist_ok=True)
-        except PermissionError as e:
-            raise PermissionError(
-                f"Cannot create checkpoint directory '{path}': {e}"
-            ) from e
+        """
+        Saves:
+            {path}/input_proj.pt      — StructureInputProjection state_dict
+            {path}/controlnet/        — ControlNet in HuggingFace format
+        """
+        os.makedirs(path, exist_ok=True)
 
-        save_path = f"{path}/sketch_adapter.pt"
+        ip_path = os.path.join(path, "input_proj.pt")
         try:
-            torch.save(self.state_dict(), save_path)
-            print(f"  [SketchAdapter] Saved → {save_path}")
-        except OSError as e:
-            raise OSError(
-                f"Could not write checkpoint file '{save_path}': {e}"
-            ) from e
+            # Unwrap compiled module if necessary
+            proj = getattr(self.input_proj, "_orig_mod", self.input_proj)
+            torch.save(proj.state_dict(), ip_path)
         except Exception as e:
-            raise RuntimeError(f"Unexpected save error: {e}") from e
+            raise RuntimeError(f"Could not save input_proj: {e}") from e
+
+        cn_path = os.path.join(path, "controlnet")
+        try:
+            cn = getattr(self.controlnet, "_orig_mod", self.controlnet)
+            cn.save_pretrained(cn_path)
+        except Exception as e:
+            raise RuntimeError(f"Could not save controlnet: {e}") from e
+
+        print(f"  [StructureControlNet] Saved → {path}")
 
     def load(self, path: str) -> None:
-        """Load adapter weights — raises with clear message on failure."""
-        import os
-        load_path = f"{path}/sketch_adapter.pt"
+        """
+        Loads:
+            {path}/input_proj.pt
+            {path}/controlnet/
+        """
+        ip_path = os.path.join(path, "input_proj.pt")
+        cn_path = os.path.join(path, "controlnet")
 
-        if not os.path.isfile(load_path):
-            files = os.listdir(path) if os.path.isdir(path) else []
+        if not os.path.isfile(ip_path):
+            avail = os.listdir(path) if os.path.isdir(path) else []
             raise FileNotFoundError(
-                f"Checkpoint file not found: '{load_path}'\n"
-                f"  Files in '{path}': {files}"
+                f"'input_proj.pt' not found in '{path}'.  Available: {avail}"
+            )
+        if not os.path.isdir(cn_path):
+            raise FileNotFoundError(
+                f"'controlnet/' directory not found in '{path}'."
             )
 
         try:
-            state = torch.load(load_path, map_location="cpu")
+            state = torch.load(ip_path, map_location="cpu", weights_only=True)
+            proj  = getattr(self.input_proj, "_orig_mod", self.input_proj)
+            miss, unex = proj.load_state_dict(state, strict=False)
+            if miss:
+                print(f"  [StructureControlNet] input_proj missing keys: {miss}")
+            if unex:
+                print(f"  [StructureControlNet] input_proj unexpected keys: {unex}")
         except Exception as e:
-            raise RuntimeError(
-                f"Could not load checkpoint file '{load_path}': {e}\n"
-                f"  The file may be corrupt. Try retraining."
-            ) from e
+            raise RuntimeError(f"Could not load input_proj from '{ip_path}': {e}") from e
 
         try:
-            missing, unexpected = self.load_state_dict(state, strict=False)
-            if missing:
-                print(f"  [SketchAdapter] Warning: missing keys: {missing}")
-            if unexpected:
-                print(f"  [SketchAdapter] Warning: unexpected keys: {unexpected}")
-            print(f"  [SketchAdapter] Loaded ← {load_path}")
-        except RuntimeError as e:
-            raise RuntimeError(
-                f"State dict mismatch loading '{load_path}': {e}\n"
-                f"  The checkpoint may have been saved with different --num_tokens "
-                f"or --img_size. Check your training config."
-            ) from e
+            loaded  = ControlNetModel.from_pretrained(cn_path)
+            cn      = getattr(self.controlnet, "_orig_mod", self.controlnet)
+            miss, _ = cn.load_state_dict(loaded.state_dict(), strict=False)
+            if miss:
+                print(f"  [StructureControlNet] controlnet missing keys: {miss}")
+        except Exception as e:
+            raise RuntimeError(f"Could not load controlnet from '{cn_path}': {e}") from e
+
+        print(f"  [StructureControlNet] Loaded ← {path}")

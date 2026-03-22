@@ -1,35 +1,44 @@
 # SGLDv2 — Structure-Guided Latent Diffusion v2
+# Architecture: Canny + MiDaS + SegFormer-B0 → StructureControlNet → Stable Diffusion
+#
 # pip install -r requirements.txt
 
-# ── Core ───────────────────────────────────────────────────────
+# ── Core ───────────────────────────────────────────────────────────────────
 torch>=2.0.0
 torchvision>=0.15.0
 
-# ── HuggingFace ────────────────────────────────────────────────
+# ── HuggingFace ────────────────────────────────────────────────────────────
 diffusers>=0.27.0
-transformers>=4.38.0
+transformers>=4.38.0      # SegformerForSemanticSegmentation + SegformerImageProcessor
 accelerate>=0.28.0
 safetensors>=0.4.0
-xformers>=0.0.23          # optional but strongly recommended
 
-# ── Image processing ───────────────────────────────────────────
+# ── Attention acceleration (strongly recommended) ──────────────────────────
+xformers>=0.0.23          # ~30% faster attention, ~40% less VRAM
+
+# ── Image processing ───────────────────────────────────────────────────────
 opencv-python>=4.8.0
 Pillow>=10.0.0
 numpy>=1.24.0
-scikit-image>=0.21.0      # for SLIC superpixel segmentation
+scikit-image>=0.21.0      # SLIC superpixel fallback for segmentation
 
-# ── CLIP perceptual loss ───────────────────────────────────────
-git+https://github.com/openai/CLIP.git
+# ── Depth estimation ────────────────────────────────────────────────────────
+# MiDaS-small is loaded via torch.hub (no separate install needed)
+# For higher quality depth, uncomment:
+# git+https://github.com/isl-org/MiDaS.git
 
-# ── Evaluation metrics ─────────────────────────────────────────
+# ── Segmentation ───────────────────────────────────────────────────────────
+# SegFormer-B0 (nvidia/segformer-b0-finetuned-ade-512-512) downloaded
+# automatically via transformers on first use (~14 MB).
+
+# ── Optional CLIP perceptual loss ──────────────────────────────────────────
+# git+https://github.com/openai/CLIP.git
+
+# ── Evaluation metrics ─────────────────────────────────────────────────────
 torchmetrics[image]>=1.3.0
 
-# ── Demo UI ────────────────────────────────────────────────────
+# ── Demo UI ────────────────────────────────────────────────────────────────
 gradio>=4.20.0
 
-# ── Utilities ──────────────────────────────────────────────────
+# ── Utilities ──────────────────────────────────────────────────────────────
 tqdm>=4.66.0
-
-# ── Optional: SAM (much better segmentation) ───────────────────
-# pip install git+https://github.com/facebookresearch/segment-anything.git
-# Then download: wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
