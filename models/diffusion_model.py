@@ -36,7 +36,7 @@ class SGLDv2Model(nn.Module):
         self,
         base_model: str  = DEFAULT_BASE_MODEL,
         img_size:   int  = 256,
-        num_tokens: int  = 16,
+        num_tokens: int  = 77,
         device:     str  = "cuda",
         dtype:      torch.dtype = torch.float16,
     ):
@@ -297,6 +297,7 @@ class SGLDv2InferencePipeline:
         # Text embeddings
         try:
             text_emb = self.model.encode_text([prompt]          * B)
+            text_emb = text_emb[:, :32, :]
             uncond   = self.model.encode_text([negative_prompt] * B)
         except Exception as e:
             raise RuntimeError(f"Text encoding failed: {e}") from e
