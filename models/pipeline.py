@@ -337,18 +337,21 @@ class SketchToImagePipeline(nn.Module):
         """
         B = sketch.shape[0]
 
-        # ── Step 1: VAE encode sketch + real image ─────────────────────────
-        sketch_latent    = self.vae_encode(sketch)          # (B,4,H//8,W//8)
-        real_latent      = self.vae_encode(real_image)      # (B,4,H//8,W//8)
+        # ── Step 1: ColoredEdgeGenerator → colored edge map ───────────────
+        # Run edge_gen first so we can use colored map for VAE encoding
+        pred_colored_map = self.edge_gen(sketch)            # (B, 3, H, W)
 
-        # ── Step 2: LCTN translates sketch latent → image latent ──────────
+        # ── Step 2: VAE encode colored map + real image ────────────────────
+        # Use colored map instead of raw sketch — closer to photo domain,
+        # so LCTN gets a better input and has a smaller gap to bridge
+        sketch_latent    = self.vae_encode(pred_colored_map.detach())  # (B,4,H//8,W//8)
+        real_latent      = self.vae_encode(real_image)                 # (B,4,H//8,W//8)
+
+        # ── Step 3: LCTN translates colored map latent → image latent ─────
         pred_latent      = self.lctn(sketch_latent)         # (B,4,H//8,W//8)
 
         # Latent loss — same as d-sketch
         loss_latent      = F.mse_loss(pred_latent, real_latent.detach())
-
-        # ── Step 3: ColoredEdgeGenerator → colored edge map ───────────────
-        pred_colored_map = self.edge_gen(sketch)            # (B, 3, H, W)
 
         # Edge-color loss — your addition
         loss_edge_color  = F.l1_loss(pred_colored_map, target_colored.detach())
@@ -472,25 +475,26 @@ class SketchToImagePipeline(nn.Module):
                     .unsqueeze(0)
                     .to(device=self.device, dtype=torch.float32))
 
-        # ── Step 1: VAE encode sketch ──────────────────────────────────────
-        # VAE may be fp16 or fp32 — autocast handles it
+        # ── Step 1: ColoredEdgeGenerator → colored map (fp32) ────────────
+        # Run edge_gen first so we can use colored map for VAE encoding
+        with torch.no_grad():
+            pred_colored = self.edge_gen(sketch_t).float()
+
+        # ── Step 2: VAE encode colored map ────────────────────────────────
+        # Use colored map instead of raw sketch — closer to photo domain
         with torch.no_grad():
             with torch.autocast(device_type="cuda",
                                 dtype=torch.float16,
                                 enabled=use_autocast):
-                vae_in = sketch_t.to(dtype=next(self.vae.parameters()).dtype)
+                vae_in = pred_colored.to(dtype=next(self.vae.parameters()).dtype)
                 dist   = self.vae.encode(vae_in).latent_dist
                 sketch_latent = dist.sample() * self.vae.config.scaling_factor
         # Bring back to fp32 for LCTN
         sketch_latent = sketch_latent.float()
 
-        # ── Step 2: LCTN → image latent (fp32) ────────────────────────────
+        # ── Step 3: LCTN → image latent (fp32) ────────────────────────────
         with torch.no_grad():
             image_latent = self.lctn(sketch_latent).float()
-
-        # ── Step 3: ColoredEdgeGenerator → colored map (fp32) ────────────
-        with torch.no_grad():
-            pred_colored = self.edge_gen(sketch_t).float()
 
         # ── Step 4: CLIP encode colored map (fp32 output) ─────────────────
         with torch.no_grad():
