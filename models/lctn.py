@@ -1,16 +1,13 @@
-import torch
 import torch.nn as nn
 
 class LCTN(nn.Module):
-    def __init__(self, input_dim=4, hidden=256, output_dim=4):
+    def __init__(self, dim=4):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden),
+            nn.Linear(dim, 64),
             nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, output_dim)
+            nn.Linear(64, dim)
         )
 
     def forward(self, x):

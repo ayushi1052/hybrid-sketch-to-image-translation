@@ -1,32 +1,44 @@
 import torch
 from PIL import Image
-from torchvision import transforms as T
 from diffusers import StableDiffusionPipeline
 
-from models.main_model import SketchToImageModel
+from models.model import SketchModel
+from utils import get_edge, get_depth, get_color
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5")
-unet = pipe.unet.to(device)
-vae = pipe.vae.to(device)
+pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5").to(device)
 
-model = SketchToImageModel(unet, vae).to(device)
+vae = pipe.vae
+unet = pipe.unet
+scheduler = pipe.scheduler
+
+model = SketchModel().to(device)
 model.load_state_dict(torch.load("model.pth"))
+model.eval()
 
-transform = T.Compose([
-    T.Resize((256, 256)),
-    T.ToTensor(),
-    T.Normalize([0.5], [0.5])
-])
+sketch = Image.open("test.png").convert("RGB")
 
-sketch = transform(Image.open("test.png").convert("RGB")).unsqueeze(0).to(device)
+edge = get_edge(sketch).unsqueeze(0).to(device)
+depth = get_depth(sketch, device)
+sketch_tensor = torch.randn(1,3,256,256).to(device)  # placeholder
+color = get_color(sketch_tensor)
 
-latent = torch.randn(1, 4, 64, 64).to(device)
-t = torch.tensor([5], device=device)
+cond = torch.cat([edge, depth, color], dim=1)
 
-with torch.no_grad():
-    out_latent = model(sketch, latent, t)
-    image = vae.decode(out_latent).sample
+latent = torch.randn(1, 4, 32, 32).to(device)
 
-Image.fromarray((image[0].cpu().numpy().transpose(1,2,0)*255).astype("uint8")).save("output.png")
+scheduler.set_timesteps(20)
+
+for t in scheduler.timesteps:
+
+    with torch.no_grad():
+        noise_pred = unet(latent, t).sample
+
+    latent = model(latent, cond)
+    latent = scheduler.step(noise_pred, t, latent).prev_sample
+
+image = vae.decode(latent / 0.18215).sample
+
+image = (image[0].cpu().permute(1,2,0).numpy() * 255).clip(0,255).astype("uint8")
+Image.fromarray(image).save("output.png")

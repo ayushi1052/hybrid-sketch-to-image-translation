@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 
 class ConditionAdapter(nn.Module):
@@ -7,13 +6,12 @@ class ConditionAdapter(nn.Module):
 
         self.conv1 = nn.Conv2d(in_ch, 64, 3, padding=1)
         self.conv2 = nn.Conv2d(64, 128, 3, padding=1)
-        self.conv3 = nn.Conv2d(128, 256, 3, padding=1)
+        self.conv3 = nn.Conv2d(128, 4, 3, padding=1)  # match latent channels
 
         self.act = nn.ReLU()
 
     def forward(self, cond):
-        f1 = self.act(self.conv1(cond))
-        f2 = self.act(self.conv2(f1))
-        f3 = self.act(self.conv3(f2))
-
-        return [f1, f2, f3]
+        x = self.act(self.conv1(cond))
+        x = self.act(self.conv2(x))
+        x = self.conv3(x)
+        return x
