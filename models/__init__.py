@@ -22,11 +22,14 @@ def _import_structure_extractor():
 
 def _import_sketch_adapter():
     try:
-        from .sketch_adapter import SketchAdapter, SketchTokenEncoder
-        return SketchAdapter, SketchTokenEncoder
+        # StructureControlNet and StructureInputProjection are the classes
+        # defined in sketch_adapter.py — SketchAdapter / SketchTokenEncoder
+        # do not exist and importing them caused every entry point to crash.
+        from .sketch_adapter import StructureControlNet, StructureInputProjection
+        return StructureControlNet, StructureInputProjection
     except ImportError as e:
         raise ImportError(
-            f"Failed to import SketchAdapter: {e}\n"
+            f"Failed to import StructureControlNet: {e}\n"
             "  Make sure torch is installed: pip install torch"
         ) from e
     except Exception as e:
@@ -51,9 +54,9 @@ def _import_diffusion_models():
 
 # Run all imports at module load time with clear error messages
 try:
-    StructureExtractor                    = _import_structure_extractor()
-    SketchAdapter, SketchTokenEncoder     = _import_sketch_adapter()
-    SGLDv2Model, SGLDv2InferencePipeline  = _import_diffusion_models()
+    StructureExtractor                          = _import_structure_extractor()
+    StructureControlNet, StructureInputProjection = _import_sketch_adapter()
+    SGLDv2Model, SGLDv2InferencePipeline        = _import_diffusion_models()
 except ImportError as e:
     print(f"\n[Import Error] {e}")
     print("  Install missing packages:  pip install -r requirements.txt\n")
@@ -61,8 +64,8 @@ except ImportError as e:
 
 __all__ = [
     "StructureExtractor",
-    "SketchAdapter",
-    "SketchTokenEncoder",
+    "StructureControlNet",
+    "StructureInputProjection",
     "SGLDv2Model",
     "SGLDv2InferencePipeline",
 ]
