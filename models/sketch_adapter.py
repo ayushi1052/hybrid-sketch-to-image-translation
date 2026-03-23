@@ -245,20 +245,33 @@ class StructureControlNet(nn.Module):
         Loads:
             {path}/input_proj.pt
             {path}/controlnet/
+
+        Validates both files exist BEFORE any weights are touched,
+        then loads state_dicts directly into the already-built modules —
+        no temporary ControlNetModel object is created.
         """
         ip_path = os.path.join(path, "input_proj.pt")
         cn_path = os.path.join(path, "controlnet")
 
+        # ── Validate both files exist upfront ─────────────────────────────
+        # This means a missing file is caught immediately, before any GPU
+        # work is done, with a clear error message.
         if not os.path.isfile(ip_path):
             avail = os.listdir(path) if os.path.isdir(path) else []
             raise FileNotFoundError(
-                f"'input_proj.pt' not found in '{path}'.  Available: {avail}"
+                f"'input_proj.pt' not found in '{path}'.\n"
+                f"  Available files: {avail}\n"
+                f"  Make sure you are pointing at a checkpoint sub-directory\n"
+                f"  (e.g. ./checkpoints/final), not the top-level output dir."
             )
         if not os.path.isdir(cn_path):
+            avail = os.listdir(path) if os.path.isdir(path) else []
             raise FileNotFoundError(
-                f"'controlnet/' directory not found in '{path}'."
+                f"'controlnet/' directory not found in '{path}'.\n"
+                f"  Available: {avail}"
             )
 
+        # ── Load input_proj ────────────────────────────────────────────────
         try:
             state = torch.load(ip_path, map_location="cpu", weights_only=True)
             proj  = getattr(self.input_proj, "_orig_mod", self.input_proj)
@@ -268,15 +281,65 @@ class StructureControlNet(nn.Module):
             if unex:
                 print(f"  [StructureControlNet] input_proj unexpected keys: {unex}")
         except Exception as e:
-            raise RuntimeError(f"Could not load input_proj from '{ip_path}': {e}") from e
+            raise RuntimeError(
+                f"Could not load input_proj from '{ip_path}': {e}"
+            ) from e
 
-        try:
-            loaded  = ControlNetModel.from_pretrained(cn_path)
-            cn      = getattr(self.controlnet, "_orig_mod", self.controlnet)
-            miss, _ = cn.load_state_dict(loaded.state_dict(), strict=False)
-            if miss:
-                print(f"  [StructureControlNet] controlnet missing keys: {miss}")
-        except Exception as e:
-            raise RuntimeError(f"Could not load controlnet from '{cn_path}': {e}") from e
+        # ── Load controlnet weights directly — no temporary object ─────────
+        # Prefer loading the raw safetensors/bin file directly into the
+        # already-built self.controlnet, avoiding a second from_pretrained
+        # call that would allocate a full duplicate model in memory.
+        cn = getattr(self.controlnet, "_orig_mod", self.controlnet)
+
+        # Determine weight file (safetensors preferred, fallback to bin)
+        sf_path  = os.path.join(cn_path, "diffusion_pytorch_model.safetensors")
+        bin_path = os.path.join(cn_path, "diffusion_pytorch_model.bin")
+
+        if os.path.isfile(sf_path):
+            try:
+                from safetensors.torch import load_file
+                state_dict = load_file(sf_path, device="cpu")
+                miss, unex = cn.load_state_dict(state_dict, strict=False)
+                if miss:
+                    print(f"  [StructureControlNet] controlnet missing keys: {miss}")
+                if unex:
+                    print(f"  [StructureControlNet] controlnet unexpected keys: {unex}")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not load controlnet weights from '{sf_path}': {e}"
+                ) from e
+
+        elif os.path.isfile(bin_path):
+            try:
+                state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
+                miss, unex = cn.load_state_dict(state_dict, strict=False)
+                if miss:
+                    print(f"  [StructureControlNet] controlnet missing keys: {miss}")
+                if unex:
+                    print(f"  [StructureControlNet] controlnet unexpected keys: {unex}")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not load controlnet weights from '{bin_path}': {e}"
+                ) from e
+
+        else:
+            # Final fallback: let diffusers handle sharded / exotic layouts.
+            # This is the old behaviour — allocates a second model temporarily.
+            print(
+                "  [StructureControlNet] No single weight file found — "
+                "falling back to ControlNetModel.from_pretrained (slower)."
+            )
+            try:
+                loaded  = ControlNetModel.from_pretrained(
+                    cn_path, torch_dtype=torch.float32
+                )
+                miss, _ = cn.load_state_dict(loaded.state_dict(), strict=False)
+                del loaded   # free the temporary copy immediately
+                if miss:
+                    print(f"  [StructureControlNet] controlnet missing keys: {miss}")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not load controlnet from '{cn_path}': {e}"
+                ) from e
 
         print(f"  [StructureControlNet] Loaded ← {path}")

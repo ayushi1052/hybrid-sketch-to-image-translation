@@ -320,6 +320,7 @@ class SGLDv2InferencePipeline:
 
     Optimisations
     ─────────────
+    • Checkpoint validated before any GPU work — fast-fail on missing files.
     • Control hint computed once and doubled for classifier-free guidance
       (avoids a redundant InputProjection forward pass).
     • UniPC multi-step scheduler: 30 steps gives DDPM-100 quality.
@@ -332,6 +333,58 @@ class SGLDv2InferencePipeline:
         "deformed, ugly, watermark, text"
     )
 
+    # ── Checkpoint validation (static — no GPU needed) ────────────────────────
+
+    @staticmethod
+    def _validate_checkpoint(adapter_path: str) -> None:
+        """
+        Checks that both required files exist before any model is loaded.
+        Called at the very start of __init__ so errors are immediate and cheap —
+        there is no point spending 30-60 s loading SD weights only to discover
+        that input_proj.pt is missing.
+        """
+        if not os.path.isdir(adapter_path):
+            raise FileNotFoundError(
+                f"Checkpoint directory not found: '{adapter_path}'\n"
+                "  Train first:  python train.py --data_dir ./dataset\n"
+                "  Then point --adapter at a sub-directory such as:\n"
+                "    ./checkpoints/final\n"
+                "    ./checkpoints/best\n"
+                "    ./checkpoints/latest"
+            )
+
+        contents = os.listdir(adapter_path)
+
+        ip_path = os.path.join(adapter_path, "input_proj.pt")
+        if not os.path.isfile(ip_path):
+            raise FileNotFoundError(
+                f"'input_proj.pt' not found in '{adapter_path}'.\n"
+                f"  Directory contains: {contents}\n"
+                f"  Make sure you are pointing at a checkpoint sub-directory\n"
+                f"  (e.g. ./checkpoints/final), not the top-level output dir."
+            )
+
+        cn_path = os.path.join(adapter_path, "controlnet")
+        if not os.path.isdir(cn_path):
+            raise FileNotFoundError(
+                f"'controlnet/' directory not found in '{adapter_path}'.\n"
+                f"  Directory contains: {contents}"
+            )
+
+        # Check at least one weight file exists inside controlnet/
+        cn_contents = os.listdir(cn_path)
+        weight_files = [
+            f for f in cn_contents
+            if f.endswith(".safetensors") or f.endswith(".bin")
+        ]
+        if not weight_files:
+            raise FileNotFoundError(
+                f"No weight files (.safetensors or .bin) found in '{cn_path}'.\n"
+                f"  controlnet/ contains: {cn_contents}"
+            )
+
+    # ── Constructor ───────────────────────────────────────────────────────────
+
     def __init__(
         self,
         adapter_path: str,
@@ -339,6 +392,11 @@ class SGLDv2InferencePipeline:
         device:       str        = "cuda",
         img_size:     int        = 256,
     ) -> None:
+        # ✅ Validate checkpoint FIRST — before touching the GPU.
+        # Any missing file raises FileNotFoundError with a clear message
+        # immediately, instead of after 30-60 s of model loading.
+        self._validate_checkpoint(adapter_path)
+
         self.device   = device
         self.img_size = img_size
         dtype = torch.float16 if device == "cuda" else torch.float32
@@ -350,6 +408,9 @@ class SGLDv2InferencePipeline:
             device     = device,
             dtype      = dtype,
         )
+
+        # load_adapter calls control_net.load() which now loads weights
+        # directly into the already-built ControlNet — no second allocation.
         self.model.load_adapter(adapter_path)
         self.model.eval()
 
@@ -363,6 +424,8 @@ class SGLDv2InferencePipeline:
             print(f"  [InferencePipeline] Could not switch to UniPC ({e}). Using DDPM.")
 
         print("  [InferencePipeline] Ready.")
+
+    # ── Generation ────────────────────────────────────────────────────────────
 
     @torch.inference_mode()
     def generate(
