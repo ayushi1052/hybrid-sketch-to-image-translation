@@ -30,6 +30,45 @@ from models.structure_gan import StructureExtractor
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
+
+import re
+
+def _normalize_stem(stem: str) -> str:
+    """
+    Converts:
+      abc123-1 → abc123
+      abc123_2 → abc123
+      abc123   → abc123
+    """
+    return re.sub(r'[-_]\d+$', '', stem)
+
+def _pair_maps(
+    sk_map: Dict[str, Path],
+    ph_map: Dict[str, Path],
+) -> List[Tuple[Path, Path]]:
+    
+    # Build photo lookup (normalized)
+    photo_lookup = {
+        _normalize_stem(stem): path
+        for stem, path in ph_map.items()
+    }
+
+    pairs = []
+    unmatched = []
+
+    for sk_stem, sk_path in sk_map.items():
+        base_id = _normalize_stem(sk_stem)
+
+        if base_id in photo_lookup:
+            pairs.append((sk_path, photo_lookup[base_id]))
+        else:
+            unmatched.append(sk_stem)
+
+    if unmatched:
+        print(f"  [Dataset] {len(unmatched)} unmatched sketches "
+              f"(example: {unmatched[:3]})")
+
+    return pairs
 # ─────────────────────────────────────────────────────────────────────────────
 # Sketch Augmentor
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,12 +198,12 @@ class SketchPhotoDataset(Dataset):
             sk_map = self._index_folder(self.sketch_root / cat)
             ph_map = self._index_folder(self.photo_root / cat)
 
-            common = sorted(set(sk_map) & set(ph_map))
+            pairs = _pair_maps(sk_map, ph_map)
 
-            for stem in common:
-                self.pairs.append((sk_map[stem], ph_map[stem], cat))
+            for sk, ph in pairs:
+                self.pairs.append((sk, ph, cat))
 
-            self.cat_counts[cat] = len(common)
+            self.cat_counts[cat] = len(pairs)
 
         if not self.pairs:
             raise RuntimeError("Dataset is empty.")
